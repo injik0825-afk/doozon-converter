@@ -12,7 +12,6 @@ st.title("📊 더존 위하고 전표 변환기")
 st.markdown("분개장 파일을 더존 일반전표 업로드 형식으로 변환합니다.")
 st.divider()
 
-# 계정과목 코드 매핑
 ACCOUNT_MAP = {
     '보통예금':                     ('10301', '보통예금'),
     '예치금':                       ('10800', '예치금'),
@@ -64,6 +63,8 @@ ACCOUNT_MAP = {
     '법인카드':                     ('10400', '보통예금'),
 }
 
+TEMPLATE_PATH = "더존위하고_일반전표입력_엑셀_업로드_Template.xlsx"
+
 def clean(v):
     if v is None:
         return None
@@ -85,19 +86,16 @@ def to_int(v):
 
 def get_account(name):
     if name is None:
-        return ('', name or '')
+        return ('', '')
     name_clean = name.strip()
     if name_clean in ACCOUNT_MAP:
         return ACCOUNT_MAP[name_clean]
-    # 부분 매칭
     for key, val in ACCOUNT_MAP.items():
         if key in name_clean or name_clean in key:
             return val
     return ('', name_clean)
 
 def parse_and_convert(uploaded_journal):
-    """분개장 파일을 파싱하여 더존 업로드 형식으로 변환"""
-
     with tempfile.NamedTemporaryFile(delete=False, suffix='.xls') as tmp:
         tmp.write(uploaded_journal.read())
         tmp_path = tmp.name
@@ -113,8 +111,6 @@ def parse_and_convert(uploaded_journal):
         os.unlink(tmp_path)
 
     data = df_raw.values
-
-    # 전표 파싱
     vouchers = []
     current_date_str = None
     current_seq_str = None
@@ -128,7 +124,6 @@ def parse_and_convert(uploaded_journal):
         col4 = clean(row[4]) if len(row) > 4 else None
         col5 = to_int(row[5]) if len(row) > 5 else 0
 
-        # 헤더/합계/제목 스킵
         if col0 in ('구     분', '월/일', '합 계'):
             continue
         if col3 and '분   개   장' in str(col3):
@@ -136,7 +131,6 @@ def parse_and_convert(uploaded_journal):
         if col3 and '분개장' in str(col3):
             continue
 
-        # 날짜가 있는 행 = 새 전표 시작
         if col0 and '/' in str(col0):
             if current_voucher_lines:
                 vouchers.append((current_date_str, current_seq_str, current_voucher_lines))
@@ -149,7 +143,6 @@ def parse_and_convert(uploaded_journal):
     if current_voucher_lines:
         vouchers.append((current_date_str, current_seq_str, current_voucher_lines))
 
-    # 더존 업로드 형식으로 변환
     upload_rows = []
     unmapped = set()
 
@@ -174,14 +167,12 @@ def parse_and_convert(uploaded_journal):
             if has_cr and acct_cr:
                 credit_entries.append({'amt': amt_cr, 'acct': acct_cr, 'memo': ''})
 
-            # 적요 처리 (금액 없고 텍스트만 있는 경우)
             if not has_dr and not has_cr:
                 if acct_dr and not memo:
                     memo = acct_dr
                 if acct_cr and not memo:
                     memo = acct_cr
 
-        # 적요를 각 항목에 적용
         for e in debit_entries:
             if not e['memo']:
                 e['memo'] = memo
@@ -189,43 +180,27 @@ def parse_and_convert(uploaded_journal):
             if not e['memo']:
                 e['memo'] = memo
 
-        # 더존 형식 행 생성
         for e in debit_entries:
             code, name = get_account(e['acct'])
             if not code:
                 unmapped.add(e['acct'])
-            upload_rows.append([
-                month, day, '차변', code, name,
-                '', '', e['memo'], e['amt'], ''
-            ])
+            upload_rows.append([month, day, '차변', code, name, '', '', e['memo'], e['amt'], ''])
 
         for e in credit_entries:
             code, name = get_account(e['acct'])
             if not code:
                 unmapped.add(e['acct'])
-            upload_rows.append([
-                month, day, '대변', code, name,
-                '', '', e['memo'], '', e['amt']
-            ])
+            upload_rows.append([month, day, '대변', code, name, '', '', e['memo'], '', e['amt']])
 
     return upload_rows, len(vouchers), unmapped
 
-def create_output_excel(upload_rows, template_file=None):
-    """더존 업로드용 엑셀 파일 생성"""
-
-    if template_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-            tmp.write(template_file.read())
-            tmp_path = tmp.name
-        wb = load_workbook(tmp_path)
+def create_output_excel(upload_rows):
+    if os.path.exists(TEMPLATE_PATH):
+        wb = load_workbook(TEMPLATE_PATH)
         ws = wb.active
-        os.unlink(tmp_path)
-
-        # 기존 데이터 행 삭제 (헤더 제외)
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             for cell in row:
                 cell.value = None
-
         for i, row_data in enumerate(upload_rows, start=2):
             for j, val in enumerate(row_data, start=1):
                 if val != '':
@@ -234,8 +209,7 @@ def create_output_excel(upload_rows, template_file=None):
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "전표데이터"
-        headers = ['월', '일', '구분', '계정과목코드', '계정과목명',
-                   '거래처코드', '거래처명', '적요명', '차변(출금)', '대변(입금)']
+        headers = ['월', '일', '구분', '계정과목코드', '계정과목명', '거래처코드', '거래처명', '적요명', '차변(출금)', '대변(입금)']
         ws.append(headers)
         for row_data in upload_rows:
             ws.append([v if v != '' else None for v in row_data])
@@ -246,26 +220,8 @@ def create_output_excel(upload_rows, template_file=None):
     return output
 
 
-# ── UI ──────────────────────────────────────────────────────────────────────
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("① 분개장 파일")
-    journal_file = st.file_uploader(
-        "분개장 (.xls / .xlsx)",
-        type=['xls', 'xlsx'],
-        key="journal"
-    )
-
-with col2:
-    st.subheader("② 더존 템플릿 (선택)")
-    template_file = st.file_uploader(
-        "템플릿 파일 (.xlsx)",
-        type=['xlsx'],
-        key="template",
-        help="없으면 기본 형식으로 생성됩니다"
-    )
+st.subheader("① 분개장 파일 업로드")
+journal_file = st.file_uploader("분개장 (.xls / .xlsx)", type=['xls', 'xlsx'], key="journal")
 
 st.divider()
 
@@ -278,9 +234,8 @@ if journal_file is not None:
                 if not upload_rows:
                     st.error("변환된 데이터가 없습니다. 파일 형식을 확인해 주세요.")
                 else:
-                    output_excel = create_output_excel(upload_rows, template_file)
+                    output_excel = create_output_excel(upload_rows)
 
-                    # 합계 계산
                     total_dr = sum(r[8] for r in upload_rows if r[8] != '')
                     total_cr = sum(r[9] for r in upload_rows if r[9] != '')
 
@@ -297,10 +252,9 @@ if journal_file is not None:
                         st.warning(
                             f"⚠️ 계정과목 코드 미매핑 항목 ({len(unmapped)}개): "
                             + ", ".join(sorted(unmapped))
-                            + "\n\n코드란이 공백으로 처리되었습니다. 더존에서 직접 수정하거나 매핑 추가를 요청해 주세요."
+                            + "\n\n매핑 추가가 필요하면 알려주세요."
                         )
 
-                    # 파일명에서 월 추출
                     fname = journal_file.name.replace('.xls', '').replace('.xlsx', '')
                     out_name = f"더존업로드_{fname}.xlsx"
 
@@ -315,7 +269,6 @@ if journal_file is not None:
 
             except Exception as e:
                 st.error(f"오류 발생: {str(e)}")
-                st.info("파일 형식이 올바른지 확인해 주세요.")
 else:
     st.info("분개장 파일을 업로드하면 변환 버튼이 활성화됩니다.")
 
