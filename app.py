@@ -689,6 +689,3 @@ if uploaded:
                 import traceback; st.code(traceback.format_exc())
 else:
     st.info("거래내역 파일을 업로드하면 변환 버튼이 활성화됩니다.")
-
-st.divider()
-st.caption("거래처 추가/수정이 필요하면 Claude에게 요청해 주세요.")
