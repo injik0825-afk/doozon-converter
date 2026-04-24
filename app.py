@@ -684,19 +684,37 @@ def create_excel(all_rows):
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 st.divider()
-uploaded = st.file_uploader("거래내역 파일 업로드 (.xlsx)", type=['xlsx'])
+uploaded_files = st.file_uploader(
+    "거래내역 파일 업로드 (.xlsx) — 여러 파일 동시 업로드 가능",
+    type=['xlsx'],
+    accept_multiple_files=True
+)
 st.divider()
 
-if uploaded:
+if uploaded_files:
+    st.info(f"📂 {len(uploaded_files)}개 파일 선택됨: {', '.join(f.name for f in uploaded_files)}")
     if st.button("🔄 변환 시작", type="primary", use_container_width=True):
         with st.spinner("변환 중..."):
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-                    tmp.write(uploaded.read())
-                    tmp_path = tmp.name
+                # 모든 파일의 시트를 합쳐서 처리
+                all_xls = []
+                for uploaded in uploaded_files:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+                        tmp.write(uploaded.read())
+                        all_xls.append((uploaded.name, tmp.name))
 
-                xl = pd.ExcelFile(tmp_path)
-                os.unlink(tmp_path)
+                # 전체 시트 목록 수집
+                all_sheets = []  # (xl, sheet_name, file_name)
+                for fname, tmp_path in all_xls:
+                    xl = pd.ExcelFile(tmp_path)
+                    for sheet in xl.sheet_names:
+                        all_sheets.append((xl, sheet, fname))
+
+                # 임시파일 경로 목록 (나중에 정리)
+                tmp_paths = [p for _, p in all_xls]
+                fname_combined = '_'.join(f.name.replace('.xlsx','') for f in uploaded_files[:2])
+                if len(uploaded_files) > 2:
+                    fname_combined += f'_외{len(uploaded_files)-2}개'
 
                 all_rows     = []
                 all_unmapped = []
@@ -705,7 +723,7 @@ if uploaded:
                 all_hantoo   = []
 
                 # 1) 한투 시트 파싱 (출고수수료 매칭 위해 먼저)
-                for sheet in xl.sheet_names:
+                for xl, sheet, fname in all_sheets:
                     if any(k in sheet for k in ['한국투자증권','한투']):
                         df = pd.read_excel(xl, sheet_name=sheet, header=None)
                         acct_id = sheet
@@ -713,7 +731,6 @@ if uploaded:
                             cell = clean(df.iloc[i, 0]) if len(df) > i else ''
                             m = re.search(r'\d{5,}-\d{2}', cell)
                             if m: acct_id = m.group(); break
-
                         trades, sbd = parse_hantoo_sheet(df, acct_id)
                         all_hantoo.extend(trades)
                         for k, v in sbd.items():
@@ -727,19 +744,16 @@ if uploaded:
                 all_unmapped.extend([{**u, '출처': '한투'} for u in sec_unmap])
 
                 # 3) 교보증권 시트 파싱
-                for sheet in xl.sheet_names:
+                for xl, sheet, fname in all_sheets:
                     if '교보' in sheet:
                         df = pd.read_excel(xl, sheet_name=sheet, header=None)
                         kyobo_rows, kyobo_unmap = process_kyobo(df)
                         all_rows.extend(kyobo_rows)
-                        all_unmapped.extend([{**u, '출처': sheet} for u in kyobo_unmap])
-                        # 교보 입고 종목도 stock_by_date에 추가
+                        all_unmapped.extend([{**u, '출처': f'{fname}>{sheet}'} for u in kyobo_unmap])
                         for r in kyobo_rows:
                             if r[2] == '차변' and r[4] == '단기매매증권':
-                                # 적요에서 날짜와 종목 추출
-                                memo_text = r[7]
                                 date_key = (r[0], r[1])
-                                cp_text  = r[6]  # 거래처명(종목명)
+                                cp_text  = r[6]
                                 stock_match = re.search(r'주식#[가-힣A-Za-z#]+#([가-힣A-Za-z0-9]+)', cp_text)
                                 if stock_match:
                                     sname = stock_match.group(1)
@@ -748,22 +762,27 @@ if uploaded:
                                         stock_by_date[date_key].append(sname)
 
                 # 4) IBK 처리 (stock_by_date 활용)
-                for sheet in xl.sheet_names:
+                for xl, sheet, fname in all_sheets:
                     if any(k in sheet for k in ['IBK','기업은행','은행']):
                         df = pd.read_excel(xl, sheet_name=sheet, header=None)
                         ibk_rows, ibk_unmap = process_ibk(df, stock_by_date)
                         all_rows.extend(ibk_rows)
-                        all_unmapped.extend([{**u, '출처': sheet} for u in ibk_unmap])
+                        all_unmapped.extend([{**u, '출처': f'{fname}>{sheet}'} for u in ibk_unmap])
 
                 # 5) 비씨카드 처리
-                for sheet in xl.sheet_names:
+                for xl, sheet, fname in all_sheets:
                     if any(k in sheet for k in ['비씨','카드','세부']):
                         df = pd.read_excel(xl, sheet_name=sheet, header=None)
                         card_rows, card_unmap = process_card(df)
                         all_rows.extend(card_rows)
-                        all_unmapped.extend([{**u, '출처': sheet} for u in card_unmap])
+                        all_unmapped.extend([{**u, '출처': f'{fname}>{sheet}'} for u in card_unmap])
 
                 # 6) 삼성/NH/미래에셋/신한/KB → 스킵 (분개 없음)
+
+                # 임시파일 정리
+                for p in tmp_paths:
+                    try: os.unlink(p)
+                    except: pass
 
                 if not all_rows:
                     st.error("변환된 데이터가 없습니다.")
@@ -783,11 +802,10 @@ if uploaded:
                         st.warning(f"⚠️ {len(all_unmapped)}건 수동 입력 또는 확인 필요")
                         st.dataframe(pd.DataFrame(all_unmapped), use_container_width=True)
 
-                    fname = uploaded.name.replace('.xlsx', '')
                     st.download_button(
                         "📥 변환 파일 다운로드",
                         data=excel_out,
-                        file_name=f"더존업로드_{fname}.xlsx",
+                        file_name=f"더존업로드_{fname_combined}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                         type="primary"
