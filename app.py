@@ -290,16 +290,21 @@ def classify_ibk(month, day, out_amt, in_amt, t1, t2, combined,
                      row(month, day, '대변', '보통예금',    '',  memo, 0, out_amt)]
             return rows
 
-        # 고유*납입 출금 → 예치금 (한투 고유계좌로 청약)
+        # 고유*납입 출금 → 예치금(한투고유) 이체 + 선급금+수수료 (2단계)
         if re.match(r'^고유[가-힣A-Za-z0-9]+납입$', t1):
             stock_name = extract_stock_from_text(t1)
-            sl         = get_stock(stock_name) if stock_name else ''
-            base       = round(out_amt / 1.01)
-            fee        = out_amt - base
-            memo       = f'{sl} 청약납입' if sl else t1
-            rows += [row(month, day, '차변', '선급금',      sl, memo, base, 0),
-                     row(month, day, '차변', '지급수수료',  sl, memo, fee,  0),
-                     row(month, day, '대변', '보통예금',    '',  memo, 0, out_amt)]
+            sl   = get_stock(stock_name) if stock_name else ''
+            base = round(out_amt / 1.01)
+            fee  = out_amt - base
+            memo = f'{sl} 청약납입' if sl else t1
+            cp_hantoo = '한국투자증권(81247132-01)'
+            # Step 1: IBK → 한투고유 이체
+            rows += [row(month, day, '차변', '예치금',     cp_hantoo, t1,   out_amt, 0),
+                     row(month, day, '대변', '보통예금',   '',         t1,   0, out_amt)]
+            # Step 2: 한투고유에서 청약납입
+            rows += [row(month, day, '차변', '선급금',     sl,         memo, base, 0),
+                     row(month, day, '차변', '지급수수료', sl,         memo, fee,  0),
+                     row(month, day, '대변', '예치금',     cp_hantoo, memo, 0, out_amt)]
             return rows
 
     # ── 입금 ──────────────────────────────────────────────────────────────────
@@ -405,7 +410,7 @@ def process_card(df):
 
 
 # ── 교보증권 처리 ─────────────────────────────────────────────────────────────
-def process_kyobo(df):
+def process_kyobo(df, cost_basis):
     """
     교보증권 형식: 1행/거래, 복수 계좌가 한 시트에 연속으로 나열
     컬럼: 거래일자, 적요명, 종목명(거래상대명), 수량, 단가, 거래금액, 정산금액, 수수료, 제세금, 예수금잔고, 유가증권잔고
@@ -470,6 +475,7 @@ def process_kyobo(df):
             memo = f'{sl}({qty}주*@{price:,})입고#{acct_short}'
             rows += [row(month, day, '차변', '단매증', sl, memo, cost, 0),
                      row(month, day, '대변', '선급금', sl, memo, 0,    cost)]
+            cost_basis[(stock, current_acct)] = {'unit_price': price, 'qty': qty}
 
         # ── 계좌대체입고/출고 (교보 내부 계좌 간 이동) → 분개 없음 ─────────
         elif '계좌대체입고' in ttype or '계좌대체출고' in ttype:
@@ -502,16 +508,25 @@ def process_kyobo(df):
 
         # ── 주식장내현금매도 / 코스닥매도 / 코스피매도 ──────────────────────
         elif any(k in ttype for k in ['매도', '현금매도']) and qty > 0 and price > 0:
-            sale = qty * price
             memo = f'{sl}({qty}주*@{price:,})매도#{acct_short}'
-            rows += [row(month, day, '차변', '예치금',      cp_sec, memo, settle, 0),
-                     row(month, day, '차변', '지급수수료',  sl,     memo, comm,   0),
-                     row(month, day, '차변', '세금과공과금', sl,    memo, tax,    0),
-                     # 취득가 모름 → 빈칸 처리
-                     row(month, day, '대변', '단매증',   sl, f'{memo} [취득가확인필요]', 0, 0),
-                     row(month, day, '대변', '처분이익', sl, f'{memo} [취득가확인필요]', 0, 0)]
-            unmapped.append({'날짜': f'{month}/{day}', '종목': stock,
-                             '수량': qty, '단가': price, '비고': '취득가 확인 후 금액 입력 필요'})
+            cost_key = (stock, current_acct)
+            rows += [row(month, day, '차변', '예치금',       cp_sec, memo, settle, 0),
+                     row(month, day, '차변', '지급수수료',   sl,     memo, comm,   0),
+                     row(month, day, '차변', '세금과공과금', sl,     memo, tax,    0)]
+            if cost_key in cost_basis:
+                acq_cost = cost_basis[cost_key]['unit_price'] * qty
+                gain = settle + comm + tax - acq_cost
+                rows += [row(month, day, '대변', '단매증', sl, memo, 0, acq_cost)]
+                if gain > 0:
+                    rows += [row(month, day, '대변', '처분이익', sl, memo, 0, gain)]
+                elif gain < 0:
+                    rows += [row(month, day, '차변', '단매손실', sl, memo, abs(gain), 0)]
+                del cost_basis[cost_key]
+            else:
+                rows += [row(month, day, '대변', '단매증',   sl, f'{memo} [취득가확인필요]', 0, 0),
+                         row(month, day, '대변', '처분이익', sl, f'{memo} [취득가확인필요]', 0, 0)]
+                unmapped.append({'날짜': f'{month}/{day}', '종목': stock,
+                                 '수량': qty, '단가': price, '비고': f'교보 취득가 확인 필요 ({acct_short})'})
 
         # ── 장내매수 ──────────────────────────────────────────────────────────
         elif '매수' in ttype and qty > 0 and price > 0:
@@ -571,6 +586,10 @@ def parse_hantoo_sheet(df, account_id):
         skip_keywords = ['공모주입고', '대여주식입고', '대여주식출고', '현금주식출고',
                          '출고수수료', 'HTS출고수수료', '타사이체입금', 'WTS추납']
         if any(k in trade_type for k in skip_keywords):
+            i += 2; continue
+
+        # HTS당사이체입고: 한투 내부 계좌 간 이동 → STOCK_DB에 없는 기존 보유 종목은 스킵
+        if 'HTS당사이체입고' in trade_type and not get_stock(stock_name):
             i += 2; continue
 
         trades.append({
@@ -766,7 +785,7 @@ if uploaded_files:
                 for xl, sheet, fname in all_sheets:
                     if '교보' in sheet:
                         df = pd.read_excel(xl, sheet_name=sheet, header=None)
-                        kyobo_rows, kyobo_unmap = process_kyobo(df)
+                        kyobo_rows, kyobo_unmap = process_kyobo(df, cost_basis)
                         all_rows.extend(kyobo_rows)
                         all_unmapped.extend([{**u, '출처': f'{fname}>{sheet}'} for u in kyobo_unmap])
                         for r in kyobo_rows:
