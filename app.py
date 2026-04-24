@@ -595,7 +595,7 @@ def parse_hantoo_sheet(df, account_id):
     # 2행 포맷(한투 전용) vs 1행 포맷 판별
     # 두 번째 헤더 행에 '거래단가', '정산금액'이 있으면 2행 포맷
     if hdr + 1 < len(df):
-        r2_vals = df.iloc[hdr + 1].astype(str).tolist()
+        r2_vals = [str(v) for v in df.iloc[hdr + 1].tolist()]
         two_row = any(k in ' '.join(r2_vals) for k in ['거래단가', '정산금액'])
     else:
         two_row = False
