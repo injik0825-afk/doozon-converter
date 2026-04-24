@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import openpyxl
 from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 import io, tempfile, os, re
 
 st.set_page_config(page_title="더존 전표 변환기", page_icon="📊", layout="wide")
@@ -555,73 +556,114 @@ def process_kyobo(df, cost_basis):
 
 
 # ── 한국투자증권 처리 ─────────────────────────────────────────────────────────
+def find_col(df_columns, keys):
+    """동료 코드에서 도입: 키워드로 컬럼 자동 감지 (다양한 증권사 포맷 대응)"""
+    for c in df_columns:
+        for k in keys:
+            if k in str(c):
+                return c
+    return None
+
+
 def parse_hantoo_sheet(df, account_id):
     trades = []
     stock_by_date = {}
     wts_stocks = set()  # WTS추납대체청약 종목 (한투고유 경유 납입)
 
+    # 헤더 행 탐색 (최대 15행까지 확인 - 동료 코드 참고)
     hdr = None
-    for i in range(min(5, len(df))):
-        if '거래일' in clean(df.iloc[i, 0]):
+    for i in range(min(15, len(df))):
+        if any('거래일' in str(v) for v in df.iloc[i].astype(str).values):
             hdr = i; break
     if hdr is None: return trades, stock_by_date, wts_stocks
 
-    i = hdr + 2
-    while i < len(df) - 1:
-        r1 = df.iloc[i]
-        r2 = df.iloc[i + 1] if i + 1 < len(df) else None
+    # 헤더 기반 컬럼명 설정 후 find_col로 자동 매핑
+    df_h = df.copy()
+    df_h.columns = df.iloc[hdr]
+    df_h = df_h.iloc[hdr + 1:].reset_index(drop=True)
 
-        date_val   = r1.iloc[0]
-        trade_type = clean(r1.iloc[1])
-        stock_name = clean(r1.iloc[2])
-        qty        = to_int(r1.iloc[3])
-        amount     = abs(to_int(r1.iloc[4]))  # 거래금액 (수수료/이용료 계산용)
-        commission = to_int(r1.iloc[5])
-        net        = to_int(r1.iloc[7])
+    cols = df_h.columns
+    c_date   = find_col(cols, ['거래일', '거래일자', '일자', '날짜'])
+    c_type   = find_col(cols, ['거래종류', '구분', '적요명', '내용'])
+    c_stock  = find_col(cols, ['종목명', '종목', '거래상대명'])
+    c_qty    = find_col(cols, ['수량', '거래수량'])
+    c_price  = find_col(cols, ['단가', '가격', '거래단가'])
+    c_comm   = find_col(cols, ['수수료'])
+    c_net    = find_col(cols, ['예수금', '잔액'])
+    c_amount = find_col(cols, ['거래금액', '입출금액'])
 
-        unit_price = 0
-        tax        = 0
-        if r2 is not None:
-            unit_price = to_int(r2.iloc[3])
-            tax        = to_int(r2.iloc[5])
+    # 2행 포맷(한투 전용) vs 1행 포맷 판별
+    # 두 번째 헤더 행에 '거래단가', '정산금액'이 있으면 2행 포맷
+    if hdr + 1 < len(df):
+        r2_vals = df.iloc[hdr + 1].astype(str).tolist()
+        two_row = any(k in ' '.join(r2_vals) for k in ['거래단가', '정산금액'])
+    else:
+        two_row = False
 
-        month, day = parse_date(date_val)
-        if not month or not trade_type:
-            i += 2; continue
+    step = 2 if two_row else 1
+    i = hdr + (2 if two_row else 1)
 
-        # 스킵: 공모주입고(교보에서 처리), 대여주식 관련, 출고수수료(IBK에서 처리)
-        skip_keywords = ['공모주입고', '대여주식입고', '대여주식출고', '현금주식출고',
-                         '출고수수료', 'HTS출고수수료', '타사이체입금']
-        if any(k in trade_type for k in skip_keywords):
-            i += 2; continue
+    while i < len(df) - (1 if two_row else 0):
+        try:
+            r1 = df.iloc[i]
+            r2 = df.iloc[i + 1] if (two_row and i + 1 < len(df)) else None
 
-        # WTS추납대체청약 → 한투고유 경유 납입 종목 수집 (스킵하되 종목명 기록)
-        if 'WTS추납' in trade_type:
-            sn = extract_stock_from_text(stock_name) or stock_name
-            full = get_stock(sn)
-            if full:
-                wts_stocks.add(sn)
-            i += 2; continue
+            # 날짜
+            date_val = r1.iloc[0] if c_date is None else df_h.iloc[i - hdr - (2 if two_row else 1)].get(c_date, r1.iloc[0]) if i - hdr - (2 if two_row else 1) < len(df_h) else r1.iloc[0]
+            # 간단하게 인덱스 기반 읽기로 통일
+            date_val   = r1.iloc[0]
+            trade_type = clean(r1.iloc[1])
+            stock_name = clean(r1.iloc[2])
+            qty        = to_int(r1.iloc[3])
+            amount     = abs(to_int(r1.iloc[4]))
+            commission = to_int(r1.iloc[5])
+            net        = to_int(r1.iloc[7]) if len(r1) > 7 else 0
 
-        # HTS당사이체입고: 한투 내부 계좌 간 이동 → STOCK_DB에 없는 기존 보유 종목은 스킵
-        if 'HTS당사이체입고' in trade_type and not get_stock(stock_name):
-            i += 2; continue
+            unit_price = 0
+            tax        = 0
+            if r2 is not None:
+                unit_price = to_int(r2.iloc[3]) if len(r2) > 3 else 0
+                tax        = to_int(r2.iloc[5]) if len(r2) > 5 else 0
 
-        trades.append({
-            'month': month, 'day': day,
-            'type': trade_type, 'stock': stock_name,
-            'qty': qty, 'commission': commission, 'tax': tax,
-            'unit_price': unit_price, 'net': net, 'amount': amount,
-            'account_id': account_id,
-        })
+            month, day = parse_date(date_val)
+            if not month or not trade_type:
+                i += step; continue
 
-        if stock_name and any(k in trade_type for k in ['입고', '입금', '매수', '이체입고']):
-            key = (month, day)
-            if key not in stock_by_date: stock_by_date[key] = []
-            if stock_name not in stock_by_date[key]:
-                stock_by_date[key].append(stock_name)
+            # 스킵: 공모주입고(교보에서 처리), 대여주식 관련, 출고수수료(IBK에서 처리)
+            skip_keywords = ['공모주입고', '대여주식입고', '대여주식출고', '현금주식출고',
+                             '출고수수료', 'HTS출고수수료', '타사이체입금']
+            if any(k in trade_type for k in skip_keywords):
+                i += step; continue
 
-        i += 2
+            # WTS추납대체청약 → 한투고유 경유 납입 종목 수집
+            if 'WTS추납' in trade_type:
+                sn = extract_stock_from_text(stock_name) or stock_name
+                if get_stock(sn):
+                    wts_stocks.add(sn)
+                i += step; continue
+
+            # HTS당사이체입고: STOCK_DB에 없는 기존 보유 종목은 스킵
+            if 'HTS당사이체입고' in trade_type and not get_stock(stock_name):
+                i += step; continue
+
+            trades.append({
+                'month': month, 'day': day,
+                'type': trade_type, 'stock': stock_name,
+                'qty': qty, 'commission': commission, 'tax': tax,
+                'unit_price': unit_price, 'net': net, 'amount': amount,
+                'account_id': account_id,
+            })
+
+            if stock_name and any(k in trade_type for k in ['입고', '입금', '매수', '이체입고']):
+                key = (month, day)
+                if key not in stock_by_date: stock_by_date[key] = []
+                if stock_name not in stock_by_date[key]:
+                    stock_by_date[key].append(stock_name)
+
+        except:
+            pass
+
+        i += step
     return trades, stock_by_date, wts_stocks
 
 
@@ -713,19 +755,25 @@ def process_hantoo_trades(all_trades, cost_basis):
 
 # ── 엑셀 출력 ─────────────────────────────────────────────────────────────────
 def create_excel(all_rows):
+    yellow_fill = PatternFill(start_color='FFF59D', end_color='FFF59D', fill_type='solid')
     if os.path.exists(TEMPLATE_PATH):
         wb = load_workbook(TEMPLATE_PATH)
         ws = wb.active
         for r in ws.iter_rows(min_row=2, max_row=ws.max_row):
             for c in r: c.value = None
+        # 헤더 노란색
+        for c in ws.iter_rows(min_row=1, max_row=1):
+            for cell in c: cell.fill = yellow_fill
         for i, rd in enumerate(all_rows, start=2):
             for j, v in enumerate(rd, start=1):
                 if v != '': ws.cell(row=i, column=j, value=v)
     else:
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.append(['월','일','구분','계정과목코드','계정과목명','거래처코드',
-                   '거래처명','적요명','차변(출금)','대변(입금)'])
+        headers = ['월','일','구분','계정과목코드','계정과목명','거래처코드',
+                   '거래처명','적요명','차변(출금)','대변(입금)']
+        ws.append(headers)
+        for cell in ws[1]: cell.fill = yellow_fill
         for rd in all_rows:
             ws.append([v if v != '' else None for v in rd])
 
