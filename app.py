@@ -290,7 +290,7 @@ def classify_ibk(month, day, out_amt, in_amt, t1, t2, combined,
                      row(month, day, '대변', '보통예금',    '',  memo, 0, out_amt)]
             return rows
 
-        # 고유*납입 출금 → 예치금(한투고유) 이체 + 선급금+수수료 (2단계)
+        # 고유*납입 출금 → 한투고유 경유(WTS종목 2단계) or 직접 청약(1단계)
         if re.match(r'^고유[가-힣A-Za-z0-9]+납입$', t1):
             stock_name = extract_stock_from_text(t1)
             sl   = get_stock(stock_name) if stock_name else ''
@@ -298,13 +298,19 @@ def classify_ibk(month, day, out_amt, in_amt, t1, t2, combined,
             fee  = out_amt - base
             memo = f'{sl} 청약납입' if sl else t1
             cp_hantoo = '한국투자증권(81247132-01)'
-            # Step 1: IBK → 한투고유 이체
-            rows += [row(month, day, '차변', '예치금',     cp_hantoo, t1,   out_amt, 0),
-                     row(month, day, '대변', '보통예금',   '',         t1,   0, out_amt)]
-            # Step 2: 한투고유에서 청약납입
-            rows += [row(month, day, '차변', '선급금',     sl,         memo, base, 0),
-                     row(month, day, '차변', '지급수수료', sl,         memo, fee,  0),
-                     row(month, day, '대변', '예치금',     cp_hantoo, memo, 0, out_amt)]
+            wts_stocks = stock_by_date.get('__wts__', set())
+            if stock_name and stock_name in wts_stocks:
+                # 2단계: IBK → 예치금(한투고유) + 청약납입
+                rows += [row(month, day, '차변', '예치금',     cp_hantoo, t1,   out_amt, 0),
+                         row(month, day, '대변', '보통예금',   '',         t1,   0, out_amt),
+                         row(month, day, '차변', '선급금',     sl,         memo, base, 0),
+                         row(month, day, '차변', '지급수수료', sl,         memo, fee,  0),
+                         row(month, day, '대변', '예치금',     cp_hantoo, memo, 0, out_amt)]
+            else:
+                # 1단계: IBK → 직접 청약납입
+                rows += [row(month, day, '차변', '선급금',     sl,  memo, base, 0),
+                         row(month, day, '차변', '지급수수료', sl,  memo, fee,  0),
+                         row(month, day, '대변', '보통예금',   '',  memo, 0, out_amt)]
             return rows
 
     # ── 입금 ──────────────────────────────────────────────────────────────────
@@ -552,12 +558,13 @@ def process_kyobo(df, cost_basis):
 def parse_hantoo_sheet(df, account_id):
     trades = []
     stock_by_date = {}
+    wts_stocks = set()  # WTS추납대체청약 종목 (한투고유 경유 납입)
 
     hdr = None
     for i in range(min(5, len(df))):
         if '거래일' in clean(df.iloc[i, 0]):
             hdr = i; break
-    if hdr is None: return trades, stock_by_date
+    if hdr is None: return trades, stock_by_date, wts_stocks
 
     i = hdr + 2
     while i < len(df) - 1:
@@ -584,8 +591,16 @@ def parse_hantoo_sheet(df, account_id):
 
         # 스킵: 공모주입고(교보에서 처리), 대여주식 관련, 출고수수료(IBK에서 처리)
         skip_keywords = ['공모주입고', '대여주식입고', '대여주식출고', '현금주식출고',
-                         '출고수수료', 'HTS출고수수료', '타사이체입금', 'WTS추납']
+                         '출고수수료', 'HTS출고수수료', '타사이체입금']
         if any(k in trade_type for k in skip_keywords):
+            i += 2; continue
+
+        # WTS추납대체청약 → 한투고유 경유 납입 종목 수집 (스킵하되 종목명 기록)
+        if 'WTS추납' in trade_type:
+            sn = extract_stock_from_text(stock_name) or stock_name
+            full = get_stock(sn)
+            if full:
+                wts_stocks.add(sn)
             i += 2; continue
 
         # HTS당사이체입고: 한투 내부 계좌 간 이동 → STOCK_DB에 없는 기존 보유 종목은 스킵
@@ -607,7 +622,7 @@ def parse_hantoo_sheet(df, account_id):
                 stock_by_date[key].append(stock_name)
 
         i += 2
-    return trades, stock_by_date
+    return trades, stock_by_date, wts_stocks
 
 
 def process_hantoo_trades(all_trades, cost_basis):
@@ -769,12 +784,16 @@ if uploaded_files:
                             cell = clean(df.iloc[i, 0]) if len(df) > i else ''
                             m = re.search(r'\d{5,}-\d{2}', cell)
                             if m: acct_id = m.group(); break
-                        trades, sbd = parse_hantoo_sheet(df, acct_id)
+                        trades, sbd, wts = parse_hantoo_sheet(df, acct_id)
                         all_hantoo.extend(trades)
                         for k, v in sbd.items():
                             if k not in stock_by_date: stock_by_date[k] = []
                             for s in v:
                                 if s not in stock_by_date[k]: stock_by_date[k].append(s)
+                        # WTS추납 종목을 stock_by_date['__wts__']에 누적
+                        if '__wts__' not in stock_by_date:
+                            stock_by_date['__wts__'] = set()
+                        stock_by_date['__wts__'].update(wts)
 
                 # 2) 한투 전표
                 sec_rows, sec_unmap = process_hantoo_trades(all_hantoo, cost_basis)
