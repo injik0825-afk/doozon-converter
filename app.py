@@ -217,17 +217,28 @@ def classify_ibk(month, day, out_amt, in_amt, t1, t2, combined,
                      row(month, day, '대변', '보통예금', '', t1, 0, out_amt)]
             return rows
 
-        # 고용보험 (예수금 + 보험료)
+        # 고용보험 → 예수금(직원분) + 보험료(사업주분) / 보통예금
+        # 직원분 비율: 0.9% / (0.9% + 사업주율) ← 리버사이드파트너스 기준 21090/93430
         if '고용보험' in t1:
-            # 근로자분/사업주분 정확한 분할은 급여대장 필요 → 전체 보험료 처리
-            rows += [row(month, day, '차변', '보험료',   '', t1, out_amt, 0),
-                     row(month, day, '대변', '보통예금', '', t1, 0, out_amt)]
+            emp_rate   = 21090 / 93430          # 직원부담 비율 (급여 변경 시 수정 필요)
+            emp_amt    = round(out_amt * emp_rate)
+            emp_amt    = min(emp_amt, out_amt)
+            boss_amt   = out_amt - emp_amt
+            rows += [row(month, day, '차변', '예수금',   '근로복지공단', t1, emp_amt,  0),
+                     row(month, day, '차변', '보험료',   '',             t1, boss_amt, 0),
+                     row(month, day, '대변', '보통예금', '',             t1, 0, out_amt)]
             return rows
 
-        # 합산보험 (건강+국민연금, 세금과공과금+예수금)
+        # 합산보험(건강+국민연금) → 예수금(건강직원분) + 세금과공과금(사업주분) + 예수금(연금직원분)
+        # 비율: 리버사이드파트너스 기준 292840 : 143540 : 143540 (급여 변경 시 수정 필요)
         if '합산보험' in t1:
-            rows += [row(month, day, '차변', '세금과공과금', '', t1, out_amt, 0),
-                     row(month, day, '대변', '보통예금',     '', t1, 0, out_amt)]
+            health_emp = round(out_amt * 292840 / 579920)
+            tax_boss   = round(out_amt * 143540 / 579920)
+            pension_emp = out_amt - health_emp - tax_boss
+            rows += [row(month, day, '차변', '예수금',       '건강보험공단', t1, health_emp,  0),
+                     row(month, day, '차변', '세금과공과금', '국민연금공단', t1, tax_boss,    0),
+                     row(month, day, '차변', '예수금',       '국민연금공단', t1, pension_emp, 0),
+                     row(month, day, '대변', '보통예금',     '',             t1, 0, out_amt)]
             return rows
 
         # 급여 출금
@@ -362,7 +373,7 @@ def process_card(df):
     df = df.iloc[hdr+1:].reset_index(drop=True)
 
     for _, r in df.iterrows():
-        date_val = r.get('결제일') or r.get('거래일')
+        date_val = r.get('거래일') or r.get('결제일')
         if not clean(date_val): continue
         month, day = parse_date(str(date_val))
         if not month: continue
@@ -542,6 +553,7 @@ def parse_hantoo_sheet(df, account_id):
         trade_type = clean(r1.iloc[1])
         stock_name = clean(r1.iloc[2])
         qty        = to_int(r1.iloc[3])
+        amount     = abs(to_int(r1.iloc[4]))  # 거래금액 (수수료/이용료 계산용)
         commission = to_int(r1.iloc[5])
         net        = to_int(r1.iloc[7])
 
@@ -555,11 +567,17 @@ def parse_hantoo_sheet(df, account_id):
         if not month or not trade_type:
             i += 2; continue
 
+        # 스킵: 공모주입고(교보에서 처리), 대여주식 관련, 출고수수료(IBK에서 처리)
+        skip_keywords = ['공모주입고', '대여주식입고', '대여주식출고', '현금주식출고',
+                         '출고수수료', 'HTS출고수수료', '타사이체입금', 'WTS추납']
+        if any(k in trade_type for k in skip_keywords):
+            i += 2; continue
+
         trades.append({
             'month': month, 'day': day,
             'type': trade_type, 'stock': stock_name,
             'qty': qty, 'commission': commission, 'tax': tax,
-            'unit_price': unit_price, 'net': net,
+            'unit_price': unit_price, 'net': net, 'amount': amount,
             'account_id': account_id,
         })
 
@@ -642,7 +660,8 @@ def process_hantoo_trades(all_trades, cost_basis):
 
         # ── 예탁금이용료 / 대여수수료 ───────────────────────────────────────────
         elif any(k in ttype for k in ['예탁금이용료', '대여수수료']):
-            amt = abs(net) if net else 0
+            # net(r1.iloc[7])은 잔액이므로, 거래금액(r1.iloc[4])인 amount 사용
+            amt = t.get('amount', 0) or abs(net)
             if amt > 0:
                 rows += [row(m, d, '차변', '예치금',   cp_sec, ttype, amt, 0),
                          row(m, d, '대변', '이자수익', '',     ttype, 0,   amt)]
