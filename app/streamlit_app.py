@@ -1,9 +1,13 @@
 """
 streamlit_app.py
 분개장 자동생성 앱 메인 UI
-
-실행: streamlit run streamlit_app.py
 """
+import sys
+import os
+
+# Streamlit Cloud 경로 설정 (이 두 줄이 핵심 수정사항)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -122,7 +126,7 @@ with tab1:
             st.success("저장됨")
 
     else:
-        st.info("4월 결산이면 3월말 포트폴리오가 필요합니다. 없어도 진행 가능하나 처분이익 계산이 부정확합니다 (해당 라인은 노란색 표시).")
+        st.info("없어도 진행 가능하나 처분이익 계산이 부정확합니다 (해당 라인은 노란색 표시).")
         st.session_state['portfolio_data'] = []
 
     st.caption(f"현재 {len(st.session_state['portfolio_data'])}개 종목")
@@ -155,20 +159,15 @@ with tab2:
             st.error("최소 하나의 거래내역 파일을 업로드하세요.")
         else:
             with st.spinner("거래내역을 분개장으로 변환하는 중..."):
-                # 1. 회사 설정 + 포트폴리오
                 company = get_company_config(company_code)
                 portfolio = Portfolio()
                 if st.session_state['portfolio_data']:
                     portfolio.load_opening_positions(st.session_state['portfolio_data'])
 
-                # 2. Converter
                 converter = Converter(company, portfolio)
-
-                # 3. 월초 평가상계
                 month_end = MonthEndProcessor(company, portfolio, converter.book)
                 month_end.generate_opening_reversal(year, month)
 
-                # 4. 파일 파싱
                 all_events = []
                 with st.expander("📋 파싱 로그", expanded=True):
                     if bank_card_file:
@@ -214,17 +213,14 @@ with tab2:
 
                     st.info(f"**총 이벤트: {len(all_events)}건**")
 
-                # 5. 변환
                 converter.convert(all_events)
 
-                # 세션 저장
                 st.session_state['converter'] = converter
                 st.session_state['portfolio'] = portfolio
                 st.session_state['company'] = company
 
                 st.success(f"✅ 변환 완료! 총 {len(converter.book.transactions)}개 거래")
 
-                # 플래그 요약 즉시 표시
                 flag_counts = converter.book.flag_counts()
                 if flag_counts:
                     st.markdown("##### 시각적 경고 표시")
@@ -256,7 +252,6 @@ with tab3:
             st.info("보유 중인 종목이 없습니다.")
         else:
             snapshot['월말종가'] = 0.0
-
             edited_prices = st.data_editor(
                 snapshot[['종목명', '수량', '평균단가', '장부가액', '월말종가', '신규']],
                 use_container_width=True,
@@ -294,7 +289,6 @@ with tab4:
         book = converter.book
         summary = book.summary()
 
-        # 기본 요약
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("총 거래 수", f"{summary['총 거래 수']:,}")
         col2.metric("총 분개 라인", f"{summary['총 분개 라인']:,}")
@@ -306,12 +300,10 @@ with tab4:
         else:
             st.error(f"❌ 차/대변 불일치 (차이: {summary['차변 합계'] - summary['대변 합계']:,})")
 
-        # 시각적 경고 요약 (색상 표시)
         flag_counts = book.flag_counts()
         if flag_counts:
             st.divider()
             st.subheader("⚠️ 검토 필요 사항 요약")
-            
             cols = st.columns(min(len(flag_counts), 4))
             for i, (f, cnt) in enumerate(flag_counts.items()):
                 with cols[i % len(cols)]:
@@ -324,7 +316,6 @@ with tab4:
                         unsafe_allow_html=True
                     )
 
-        # 거래 유형별 통계
         st.divider()
         st.subheader("거래 유형별 분포")
         type_df = pd.DataFrame(
@@ -333,12 +324,9 @@ with tab4:
         ).sort_values('건수', ascending=False)
         st.dataframe(type_df, use_container_width=True, hide_index=True)
 
-        # 검토 필요 라인만 보기
         if flag_counts:
             st.divider()
             st.subheader("🔍 검토 필요 라인 (색상별)")
-            
-            # 플래그 필터
             flag_options = [f.value for f in flag_counts.keys()]
             selected_flags = st.multiselect(
                 "표시할 플래그 선택",
@@ -346,83 +334,62 @@ with tab4:
                 default=flag_options,
                 format_func=lambda v: LABEL_KO[Flag(v)],
             )
-            
             if selected_flags:
                 selected_flag_set = {Flag(v) for v in selected_flags}
                 flagged_entries = [
                     e for e in book.all_entries()
                     if any(f in selected_flag_set for f in e.flags)
                 ]
-                
                 if flagged_entries:
                     st.caption(f"총 {len(flagged_entries)}개 라인")
-                    
-                    # 컬러 표시 DataFrame
-                    rows = []
-                    bg_colors = []
+                    rows, bg_colors = [], []
                     for e in flagged_entries:
                         d = e.to_dict()
                         d['_경고'] = ', '.join(e.flag_labels)
                         d['_메모'] = e.메모
                         rows.append(d)
                         bg_colors.append(ST_BG_COLOR.get(e.top_flag, ''))
-                    
                     review_df = pd.DataFrame(rows)
-                    
                     def highlight_review(row):
                         idx = row.name
                         if idx < len(bg_colors) and bg_colors[idx]:
                             return [f'background-color: {bg_colors[idx]}'] * len(row)
                         return [''] * len(row)
-                    
                     styled = review_df.style.apply(highlight_review, axis=1)
                     st.dataframe(styled, use_container_width=True, height=400)
 
-        # 미처리 이벤트
         if converter.unhandled_events:
             with st.expander(f"🔧 미처리 이벤트 ({len(converter.unhandled_events)}건)"):
                 unhandled_df = pd.DataFrame([
-                    {
-                        '날짜': e.날짜, '유형': e.event_type, '원천': e.원천,
-                        '금액': e.총액, '종목': e.종목명, '적요': e.적요원본,
-                    }
+                    {'날짜': e.날짜, '유형': e.event_type, '원천': e.원천,
+                     '금액': e.총액, '종목': e.종목명, '적요': e.적요원본}
                     for e in converter.unhandled_events
                 ])
                 st.dataframe(unhandled_df, use_container_width=True)
 
-        # 분개장 미리보기 (전체)
         st.divider()
-        st.subheader("📝 분개장 미리보기 (전체 - 컬러 표시)")
+        st.subheader("📝 분개장 미리보기")
         all_entries = book.all_entries()
         preview_count = min(200, len(all_entries))
-        
-        rows = []
-        bg_colors = []
+        rows, bg_colors = [], []
         for e in all_entries[:preview_count]:
-            d = e.to_dict()
-            rows.append(d)
+            rows.append(e.to_dict())
             bg_colors.append(ST_BG_COLOR.get(e.top_flag, ''))
-        
         if rows:
             preview_df = pd.DataFrame(rows)
-            
             def highlight_preview(row):
                 idx = row.name
                 if idx < len(bg_colors) and bg_colors[idx]:
                     return [f'background-color: {bg_colors[idx]}'] * len(row)
                 return [''] * len(row)
-            
             styled = preview_df.style.apply(highlight_preview, axis=1)
             st.dataframe(styled, use_container_width=True, height=400)
-            
             if len(all_entries) > preview_count:
-                st.caption(f"... 전체 {len(all_entries):,}행 중 처음 {preview_count}행 표시 (전체는 다운로드)")
+                st.caption(f"... 전체 {len(all_entries):,}행 중 처음 {preview_count}행 표시")
 
-        # 다운로드
         st.divider()
         st.subheader("📥 다운로드")
         col_d1, col_d2 = st.columns(2)
-
         with col_d1:
             excel_bytes = export_journal_to_duzone(
                 book, include_legend=True, include_review_sheet=True
@@ -434,9 +401,7 @@ with tab4:
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 type='primary',
                 use_container_width=True,
-                help="색상이 입혀진 엑셀 파일. '검토필요' 시트에 플래그 라인만 모아서 보여줍니다."
             )
-
         with col_d2:
             if 'portfolio' in st.session_state:
                 pf_snapshot = st.session_state['portfolio'].snapshot()
